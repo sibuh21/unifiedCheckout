@@ -616,17 +616,8 @@ func main() {
 			return
 		}
 
-		// Cybersource validates that every origin in targetOrigins matches the current page origin.
-		// If extra origins are present in the array, the client SDK throws UNUSED_TARGET_ORIGINS.
-		// Therefore, we use strictly the single matching origin for the current page session.
-		targetOrigin := "https://localhost:5173"
-		if reqData.TargetOrigin != "" && isValidFQDNOrigin(reqData.TargetOrigin) {
-			targetOrigin = reqData.TargetOrigin
-		} else if originHeader := c.GetHeader("Origin"); originHeader != "" && isValidFQDNOrigin(originHeader) {
-			targetOrigin = originHeader
-		}
-
-		targetOrigins := []string{targetOrigin}
+		// Strictly use only https://localhost:5173 as the target origin
+		targetOrigins := []string{"https://localhost:5173"}
 
 		amount := "21.00"
 		if reqData.Amount != "" && reqData.Amount != "0.00" {
@@ -919,117 +910,7 @@ func main() {
 		})
 	})
 
-	// 6. Programmatically Subscribe to Cybersource Webhooks
-	r.POST("/api/cybersource/webhooks/subscribe", func(c *gin.Context) {
-		var reqData struct {
-			WebhookURL string   `json:"webhookUrl"`
-			ProductID  string   `json:"productId"`
-			EventTypes []string `json:"eventTypes"`
-			Name       string   `json:"name"`
-		}
-
-		if err := c.ShouldBindJSON(&reqData); err != nil || reqData.WebhookURL == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "webhookUrl is required"})
-			return
-		}
-
-		if reqData.ProductID == "" {
-			reqData.ProductID = "payments"
-		}
-		if len(reqData.EventTypes) == 0 {
-			if reqData.ProductID == "unifiedCheckout" {
-				reqData.EventTypes = []string{"uc.orders.transactionresults"}
-			} else {
-				reqData.EventTypes = []string{"payments.payments.updated", "payments.payments.created"}
-			}
-		}
-		if reqData.Name == "" {
-			reqData.Name = "Unified Checkout Subscription"
-		}
-
-		path := "/notification-subscriptions/v2/webhooks"
-		payload := map[string]interface{}{
-			"name":                reqData.Name,
-			"description":         "Subscribed from Unified Checkout app",
-			"organizationId":      MerchantID,
-			"productId":           reqData.ProductID,
-			"eventTypes":          reqData.EventTypes,
-			"webhookUrl":          reqData.WebhookURL,
-			"notificationVersion": "1.0",
-			"retryPolicy": map[string]interface{}{
-				"algorithm":          "EXPONENTIAL",
-				"firstRetryInterval": 60,
-				"numberOfRetries":    3,
-			},
-			"securityPolicy": map[string]interface{}{
-				"securityType": "KEY",
-				"proxyType":    "EXTERNAL",
-			},
-		}
-
-		resp, respBody, err := sendCybersourceRequest("POST", path, payload)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Subscription request failed", "details": err.Error()})
-			return
-		}
-
-		var result map[string]interface{}
-		_ = json.Unmarshal(respBody, &result)
-
-		c.JSON(resp.StatusCode, gin.H{
-			"statusCode": resp.StatusCode,
-			"details":    result,
-		})
-	})
-
-	// 7. Retrieve Active Cybersource Webhook Subscriptions
-	r.GET("/api/cybersource/webhooks/subscriptions", func(c *gin.Context) {
-		path := fmt.Sprintf("/notification-subscriptions/v2/webhooks?organizationId=%s", MerchantID)
-		resp, respBody, err := sendCybersourceRequest("GET", path, nil)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch subscriptions", "details": err.Error()})
-			return
-		}
-
-		var result interface{}
-		_ = json.Unmarshal(respBody, &result)
-
-		c.JSON(resp.StatusCode, result)
-	})
-
-	// 7a. Activate a Webhook Subscription
-	r.POST("/api/cybersource/webhooks/activate/:webhookId", func(c *gin.Context) {
-		webhookID := c.Param("webhookId")
-		path := fmt.Sprintf("/notification-subscriptions/v2/webhooks/%s/status", webhookID)
-		payload := map[string]interface{}{
-			"status": "ACTIVE",
-		}
-		resp, respBody, err := sendCybersourceRequest("PUT", path, payload)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to activate subscription", "details": err.Error()})
-			return
-		}
-		var result map[string]interface{}
-		_ = json.Unmarshal(respBody, &result)
-		c.JSON(resp.StatusCode, gin.H{"statusCode": resp.StatusCode, "details": result})
-	})
-
-	// 7b. Retrieve Enabled Webhook Products and Event Types
-	r.GET("/api/cybersource/webhooks/products", func(c *gin.Context) {
-		path := fmt.Sprintf("/notification-subscriptions/v2/products/%s", MerchantID)
-		resp, respBody, err := sendCybersourceRequest("GET", path, nil)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch products", "details": err.Error()})
-			return
-		}
-
-		var result map[string]interface{}
-		_ = json.Unmarshal(respBody, &result)
-
-		c.JSON(resp.StatusCode, result)
-	})
-
-	// 8. Simulate a Webhook (for local dev and testing)
+	// 6. Simulate a Webhook (for local dev and testing)
 	r.POST("/api/webhooks/simulate", func(c *gin.Context) {
 		var simData struct {
 			OrderCode string `json:"orderCode"`

@@ -9,14 +9,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/joho/godotenv"
 )
 
 func init() {
@@ -318,7 +316,7 @@ func TestOrderCreationAndWebhookFlow(t *testing.T) {
 }
 
 func TestSessionsPayloadStructure(t *testing.T) {
-	targetOrigins := []string{"https://4tdw3h1m-5173.use.devtunnels.ms"}
+	targetOrigins := []string{"https://localhost:5173"}
 	amount := "21.00"
 	orderCode := "ORD-TEST-99"
 
@@ -579,21 +577,4 @@ func TestNoAuthWebhookSignatureSupport(t *testing.T) {
 	if !valid {
 		t.Fatalf("Expected No Auth webhook to be permitted, got reason: %s", reason)
 	}
-}
-
-func TestQueryCybersourceWebhooks(t *testing.T) {
-	_ = godotenv.Overload(".env")
-	MerchantID = os.Getenv("CS_MERCHANT_ID")
-	KeyID = os.Getenv("CS_KEY_ID")
-	SecretKey = os.Getenv("CS_SECRET_KEY")
-
-	webhookID := "5afa58ec-060b-5cb2-e063-a0588e0a6a8f"
-
-	path := fmt.Sprintf("/notification-subscriptions/v2/webhooks/%s", webhookID)
-	resp, body, err := sendCybersourceRequest("GET", path, nil)
-	if err != nil {
-		t.Skipf("Network error: %v", err)
-		return
-	}
-	t.Logf("Webhook %s status (HTTP %d): %s", webhookID, resp.StatusCode, string(body))
 }
