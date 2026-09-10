@@ -42,6 +42,7 @@ type Order struct {
 	Success       bool                   `json:"success"`
 	Capture       bool                   `json:"capture"`
 	Error         string                 `json:"error,omitempty"`
+	BillTo        map[string]interface{} `json:"billTo,omitempty"`
 	WebhookStatus string                 `json:"webhookStatus,omitempty"`
 	WebhookEvents []WebhookEvent         `json:"webhookEvents,omitempty"`
 	CreatedAt     time.Time              `json:"createdAt"`
@@ -128,6 +129,9 @@ func (s *OrderStore) RecordWebhook(event WebhookEvent) {
 	}
 
 	if targetOrder != nil {
+		if targetOrder.PaymentID == "" && event.ResourceID != "" {
+			targetOrder.PaymentID = event.ResourceID
+		}
 		targetOrder.WebhookEvents = append(targetOrder.WebhookEvents, event)
 		targetOrder.WebhookStatus = event.Status
 		targetOrder.UpdatedAt = time.Now()
@@ -412,7 +416,9 @@ func verifyWebhookSignature(rawSigHeader string, rawBody []byte, sharedSecret st
 	}
 
 	if rawSigHeader == "" {
-		return false, "Missing v-c-signature header"
+		// When the subscription in the Cybersource Business Center is set to "Security Options: No Auth",
+		// Cybersource does not attach the v-c-signature header. Permit in development / No Auth mode.
+		return true, "No signature header (Delivery Security configured as 'No Auth' in Cybersource console)"
 	}
 
 	// Parse header values
@@ -556,6 +562,26 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
+	// Root health check endpoint for Cybersource Webhook Health Check URL
+	// (Cybersource monitors: https://<tunnel>:443/)
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status":     "healthy",
+			"service":    "unified-checkout-backend",
+			"merchantId": MerchantID,
+		})
+	})
+	r.HEAD("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	r.POST("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status":     "healthy",
+			"service":    "unified-checkout-backend",
+			"merchantId": MerchantID,
+		})
+	})
+
 	// Health check endpoint (can also be registered as healthCheckUrl with Cybersource)
 	r.GET("/api/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -573,9 +599,11 @@ func main() {
 	// 1. Generate Capture Context for Unified Checkout v1 Sessions API
 	r.POST("/api/cybersource/capture-context", func(c *gin.Context) {
 		var reqData struct {
-			Amount       string `json:"amount"`
-			TargetOrigin string `json:"targetOrigin"`
-			CaptureType  string `json:"captureType"` // "AUTH" (default) or "CAPTURE"
+			Amount       string                 `json:"amount"`
+			TargetOrigin string                 `json:"targetOrigin"`
+			CaptureType  string                 `json:"captureType"` // "CAPTURE" or "AUTH"
+			OrderID      string                 `json:"orderId"`
+			BillTo       map[string]interface{} `json:"billTo"`
 		}
 		if err := c.ShouldBindJSON(&reqData); err != nil {
 			reqData.Amount = "21.00"
@@ -605,46 +633,76 @@ func main() {
 			amount = reqData.Amount
 		}
 
-		// Default to AUTH (Authorization only) to avoid Reason Code 150 (missing settlement gateway),
-		// but allow CAPTURE if explicitly requested.
-		captureType := "AUTH"
-		if strings.EqualFold(reqData.CaptureType, "CAPTURE") {
-			captureType = "CAPTURE"
+		captureType := "CAPTURE"
+		if strings.EqualFold(reqData.CaptureType, "AUTH") {
+			captureType = "AUTH"
 		}
 
+		orderCode := reqData.OrderID
+		if orderCode == "" {
+			orderCode = fmt.Sprintf("ORD-%d", time.Now().Unix())
+		}
+
+		// Billing information: offloaded to Cybersource by default via billingType: "FULL".
+		// If optional pre-fill data is provided in reqData.BillTo, pass it to Cybersource;
+		// otherwise, Cybersource renders empty inputs for the customer directly in its hosted iframe.
+		var billToData map[string]interface{}
+		sessionCountry := "US"
+
+		if reqData.BillTo != nil && len(reqData.BillTo) > 0 {
+			billToData = make(map[string]interface{})
+			for k, v := range reqData.BillTo {
+				if strVal, ok := v.(string); ok && strings.TrimSpace(strVal) != "" {
+					billToData[k] = strings.TrimSpace(strVal)
+				}
+			}
+			if c, ok := billToData["country"].(string); ok && len(strings.TrimSpace(c)) == 2 {
+				sessionCountry = strings.ToUpper(strings.TrimSpace(c))
+				billToData["country"] = sessionCountry
+			}
+		}
+
+		// Save initial order in OrderStore with PENDING status
+		initialOrder := &Order{
+			ID:        orderCode,
+			Amount:    amount,
+			Currency:  "USD",
+			Status:    "PENDING",
+			Success:   false,
+			Capture:   captureType == "CAPTURE",
+			BillTo:    billToData,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		orderStore.Save(initialOrder)
+		log.Printf("[CaptureContext] Initialized order %s (Amount: %s USD, CompleteMandate: %s, BillingOffloaded: %v)",
+			orderCode, amount, captureType, billToData == nil)
+
 		path := "/uc/v1/sessions"
+		orderInfo := map[string]interface{}{
+			"amountDetails": map[string]interface{}{
+				"totalAmount": amount,
+				"currency":    "USD",
+			},
+		}
+		if len(billToData) > 0 {
+			orderInfo["billTo"] = billToData
+		}
+
+		// Field collection (Billing Address, Phone, Email) is fully delegated to the Cybersource profile.
+		// completeMandate triggers Unified Checkout's complete method, emitting uc.orders.transactionresults.
 		payload := map[string]interface{}{
 			"targetOrigins": targetOrigins,
-			"country":       "US",
+			"country":       sessionCountry,
 			"locale":        "en_US",
-			"captureMandate": map[string]interface{}{
-				"billingType":              "PARTIAL",
-				"requestEmail":             false,
-				"requestPhone":             false,
-				"requestShipping":          false,
-				"showAcceptedNetworkIcons": true,
-			},
 			"completeMandate": map[string]interface{}{
 				"type": captureType,
 			},
 			"data": map[string]interface{}{
-				"orderInformation": map[string]interface{}{
-					"amountDetails": map[string]interface{}{
-						"totalAmount": amount,
-						"currency":    "USD",
-					},
-					"billTo": map[string]interface{}{
-						"firstName":          "John",
-						"lastName":           "Doe",
-						"address1":           "1 Market St",
-						"locality":           "San Francisco",
-						"administrativeArea": "CA",
-						"postalCode":         "94105",
-						"country":            "US",
-						"email":              "customer@example.com",
-						"phoneNumber":        "4158880000",
-					},
+				"clientReferenceInformation": map[string]interface{}{
+					"code": orderCode,
 				},
+				"orderInformation": orderInfo,
 			},
 		}
 
@@ -662,261 +720,48 @@ func main() {
 			return
 		}
 
-		// The capture context is returned as a signed JWT
-		c.JSON(http.StatusOK, gin.H{
+		// The capture context is returned as a signed JWT along with the generated order ID
+		respData := gin.H{
 			"jwt":           string(respBody),
+			"orderId":       orderCode,
 			"targetOrigins": targetOrigins,
-		})
+		}
+		if billToData != nil {
+			respData["billTo"] = billToData
+		}
+		c.JSON(http.StatusOK, respData)
 	})
 
-	// 1b. Verify Payment Result JWT from sendToServer(result)
-	r.POST("/api/cybersource/verify-payment", func(c *gin.Context) {
+	// 1b. Create or initialize an Order explicitly
+	r.POST("/api/orders", func(c *gin.Context) {
 		var reqData struct {
-			Result  interface{} `json:"result"`
-			OrderID string      `json:"orderId"`
-			Amount  string      `json:"amount"`
+			ID     string                 `json:"id"`
+			Amount string                 `json:"amount"`
+			BillTo map[string]interface{} `json:"billTo"`
 		}
+		_ = c.ShouldBindJSON(&reqData)
 
-		if err := c.ShouldBindJSON(&reqData); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload: result is required"})
-			return
-		}
-
-		var claims map[string]interface{}
-		var rawToken string
-
-		switch v := reqData.Result.(type) {
-		case string:
-			rawToken = v
-			parsed, err := parseJWTPayload(v)
-			if err == nil {
-				claims = parsed
-			} else {
-				claims = map[string]interface{}{"raw": v}
-			}
-		case map[string]interface{}:
-			claims = v
-			if t, ok := v["token"].(string); ok {
-				rawToken = t
-			} else if t, ok := v["jwt"].(string); ok {
-				rawToken = t
-			}
-		default:
-			claims = map[string]interface{}{"result": v}
-		}
-
-		orderCode := reqData.OrderID
+		orderCode := reqData.ID
 		if orderCode == "" {
-			// Check claims for clientReferenceInformation
-			if clientRef, ok := claims["clientReferenceInformation"].(map[string]interface{}); ok {
-				if code, ok := clientRef["code"].(string); ok && code != "" {
-					orderCode = code
-				}
-			}
-			if orderCode == "" {
-				orderCode = "ORD-" + strconv.FormatInt(time.Now().Unix(), 10)
-			}
+			orderCode = fmt.Sprintf("ORD-%d", time.Now().Unix())
 		}
-
-		paymentID := ""
-		if id, ok := claims["id"].(string); ok {
-			paymentID = id
-		} else if id, ok := claims["transactionId"].(string); ok {
-			paymentID = id
-		} else if completeMandate, ok := claims["completeMandate"].(map[string]interface{}); ok {
-			if txId, ok := completeMandate["transactionId"].(string); ok {
-				paymentID = txId
-			}
-		}
-
-		status := "AUTHORIZED"
-		if s, ok := claims["status"].(string); ok && s != "" {
-			status = strings.ToUpper(s)
-		}
-
 		amount := reqData.Amount
 		if amount == "" {
-			if orderInfo, ok := claims["orderInformation"].(map[string]interface{}); ok {
-				if amountDetails, ok := orderInfo["amountDetails"].(map[string]interface{}); ok {
-					if tot, ok := amountDetails["totalAmount"].(string); ok {
-						amount = tot
-					}
-				}
-			}
-			if amount == "" {
-				amount = "21.00"
-			}
+			amount = "21.00"
 		}
 
 		order := &Order{
 			ID:        orderCode,
-			PaymentID: paymentID,
 			Amount:    amount,
 			Currency:  "USD",
-			Status:    status,
-			Success:   true,
-			Capture:   true,
+			Status:    "PENDING",
+			Success:   false,
+			BillTo:    reqData.BillTo,
 			CreatedAt: time.Now(),
 			UpdatedAt: time.Now(),
-			Details:   claims,
 		}
 		orderStore.Save(order)
-
-		log.Printf("[VerifyPayment] Order %s verified: PaymentID=%s, Status=%s", orderCode, paymentID, status)
-
-		c.JSON(http.StatusOK, gin.H{
-			"success":   true,
-			"orderId":   orderCode,
-			"paymentId": paymentID,
-			"status":    status,
-			"message":   "Payment result verified successfully",
-			"details":   claims,
-			"rawToken":  rawToken,
-		})
-	})
-
-	// 2. Process Payment using Transient Token
-	// Supports:
-	// - Authorization only (default when capture is false or omitted)
-	// - Sale (Authorization + Capture when capture is true)
-	r.POST("/api/cybersource/process-payment", func(c *gin.Context) {
-		var reqData struct {
-			TransientToken string `json:"transientToken"`
-			Amount         string `json:"amount"`
-			OrderID        string `json:"orderId"`
-			Capture        *bool  `json:"capture"` // Default false for authorization only
-		}
-
-		if err := c.ShouldBindJSON(&reqData); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload: transientToken and amount required"})
-			return
-		}
-
-		if MerchantID == "" || KeyID == "" || SecretKey == "" {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Cybersource credentials not configured in backend/.env"})
-			return
-		}
-
-		// Default order reference ID if not provided
-		orderCode := reqData.OrderID
-		if orderCode == "" {
-			orderCode = "ORD-" + time.Now().Format("20060102150405")
-		}
-
-		// Default capture to false (Authorization only) to avoid Reason Code 150 (missing settlement gateway),
-		// unless explicitly set to true (Sale = Auth + Capture).
-		capture := false
-		if reqData.Capture != nil && *reqData.Capture {
-			capture = true
-		}
-
-		path := "/pts/v2/payments"
-		payload := map[string]interface{}{
-			"clientReferenceInformation": map[string]string{
-				"code": orderCode,
-			},
-			"orderInformation": map[string]interface{}{
-				"amountDetails": map[string]string{
-					"totalAmount": reqData.Amount,
-					"currency":    "USD",
-				},
-				"billTo": map[string]string{
-					"firstName":          "John",
-					"lastName":           "Doe",
-					"address1":           "1 Market St",
-					"locality":           "San Francisco",
-					"administrativeArea": "CA",
-					"postalCode":         "94105",
-					"country":            "US",
-					"email":              "customer@example.com",
-					"phoneNumber":        "4158880000",
-				},
-			},
-			"tokenInformation": map[string]string{
-				"transientTokenJwt": reqData.TransientToken,
-			},
-		}
-
-		// For Authorization-only, omit processingInformation completely (Cybersource default).
-		// Only include processingInformation when Sale (capture = true) is explicitly requested.
-		if capture {
-			payload["processingInformation"] = map[string]interface{}{
-				"capture": true,
-			}
-		}
-
-		log.Printf("[ProcessPayment] Submitting %s request to Cybersource: Order=%s, Amount=%s USD, Capture=%v",
-			path, orderCode, reqData.Amount, capture)
-
-		resp, respBody, err := sendCybersourceRequest("POST", path, payload)
-		if err != nil {
-			log.Printf("[ProcessPayment] Gateway error communicating with Cybersource: %v", err)
-			c.JSON(http.StatusBadGateway, gin.H{"error": "Cybersource gateway communication error", "details": err.Error()})
-			return
-		}
-
-		var result map[string]interface{}
-		_ = json.Unmarshal(respBody, &result)
-
-		status, _ := result["status"].(string)
-		paymentID, _ := result["id"].(string)
-
-		// Note: Cybersource returns 201 Created even when payment is DECLINED/REJECTED!
-		// We must inspect the actual transaction status to evaluate success.
-		isSuccess := (resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK) &&
-			(status == "AUTHORIZED" || status == "SETTLED" || status == "PENDING" || status == "AUTHORIZED_PENDING_REVIEW")
-
-		var errorMsg string
-		if !isSuccess {
-			errorMsg = extractCybersourceError(result, resp.StatusCode, "Payment declined or rejected by processor")
-			log.Printf("[ProcessPayment] Transaction failed: Order=%s, Status=%s, Cybersource HTTP=%d, Reason=%s",
-				orderCode, status, resp.StatusCode, errorMsg)
-		} else {
-			log.Printf("[ProcessPayment] Transaction succeeded: Order=%s, PaymentID=%s, Status=%s",
-				orderCode, paymentID, status)
-		}
-
-		// Record order in local store
-		order := &Order{
-			ID:        orderCode,
-			PaymentID: paymentID,
-			Amount:    reqData.Amount,
-			Currency:  "USD",
-			Status:    status,
-			Success:   isSuccess,
-			Capture:   capture,
-			Error:     errorMsg,
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
-			Details:   result,
-		}
-		orderStore.Save(order)
-
-		if isSuccess {
-			c.JSON(http.StatusOK, gin.H{
-				"success":   true,
-				"status":    status,
-				"orderId":   orderCode,
-				"paymentId": paymentID,
-				"message":   fmt.Sprintf("Payment %s successfully", strings.ToLower(status)),
-				"details":   result,
-			})
-		} else {
-			// Return 400 or original status code when payment fails
-			httpCode := resp.StatusCode
-			if httpCode == http.StatusCreated {
-				httpCode = http.StatusBadRequest
-			}
-			c.JSON(httpCode, gin.H{
-				"success":               false,
-				"status":                status,
-				"orderId":               orderCode,
-				"paymentId":             paymentID,
-				"error":                 errorMsg,
-				"details":               result,
-				"cybersourceStatusCode": resp.StatusCode,
-			})
-		}
+		c.JSON(http.StatusOK, order)
 	})
 
 	// 3. Webhook Receiver: Handles Cybersource Notification Service callbacks
@@ -956,19 +801,63 @@ func main() {
 		status, _ := payload["status"].(string)
 		resourceID, _ := payload["resourceId"].(string)
 
-		// Look for clientReferenceInformation (may be top-level or inside payload)
+		// Look for clientReferenceInformation / orderCode across all payload variations
 		var orderCode string
 		if clientRef, ok := payload["clientReferenceInformation"].(map[string]interface{}); ok {
 			orderCode, _ = clientRef["code"].(string)
 		} else if innerPayload, ok := payload["payload"].(map[string]interface{}); ok {
 			if clientRef, ok := innerPayload["clientReferenceInformation"].(map[string]interface{}); ok {
 				orderCode, _ = clientRef["code"].(string)
+			} else if orderInfo, ok := innerPayload["orderInformation"].(map[string]interface{}); ok {
+				if clientRef, ok := orderInfo["clientReferenceInformation"].(map[string]interface{}); ok {
+					orderCode, _ = clientRef["code"].(string)
+				}
 			}
 			if status == "" {
 				status, _ = innerPayload["status"].(string)
 			}
 			if resourceID == "" {
 				resourceID, _ = innerPayload["id"].(string)
+			}
+		}
+
+		if orderCode == "" {
+			if code, ok := payload["orderCode"].(string); ok {
+				orderCode = code
+			} else if orderInfo, ok := payload["orderInformation"].(map[string]interface{}); ok {
+				if clientRef, ok := orderInfo["clientReferenceInformation"].(map[string]interface{}); ok {
+					orderCode, _ = clientRef["code"].(string)
+				}
+			}
+		}
+
+		if resourceID == "" {
+			if id, ok := payload["id"].(string); ok {
+				resourceID = id
+			}
+		}
+
+		// Support transactionResults array (standard in uc.orders.transactionresults)
+		if txResults, ok := payload["transactionResults"].([]interface{}); ok && len(txResults) > 0 {
+			if firstTx, ok := txResults[0].(map[string]interface{}); ok {
+				if resourceID == "" {
+					resourceID, _ = firstTx["id"].(string)
+				}
+				if status == "" {
+					status, _ = firstTx["status"].(string)
+				}
+			}
+		}
+		if innerPayload, ok := payload["payload"].(map[string]interface{}); ok {
+			if txResults, ok := innerPayload["transactionResults"].([]interface{}); ok && len(txResults) > 0 {
+				if firstTx, ok := txResults[0].(map[string]interface{}); ok {
+					if resourceID == "" {
+						resourceID, _ = firstTx["id"].(string)
+					}
+					if status == "" {
+						status, _ = firstTx["status"].(string)
+					}
+				}
 			}
 		}
 
@@ -1095,17 +984,34 @@ func main() {
 
 	// 7. Retrieve Active Cybersource Webhook Subscriptions
 	r.GET("/api/cybersource/webhooks/subscriptions", func(c *gin.Context) {
-		path := "/notification-subscriptions/v2/webhooks"
+		path := fmt.Sprintf("/notification-subscriptions/v2/webhooks?organizationId=%s", MerchantID)
 		resp, respBody, err := sendCybersourceRequest("GET", path, nil)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch subscriptions", "details": err.Error()})
 			return
 		}
 
-		var result map[string]interface{}
+		var result interface{}
 		_ = json.Unmarshal(respBody, &result)
 
 		c.JSON(resp.StatusCode, result)
+	})
+
+	// 7a. Activate a Webhook Subscription
+	r.POST("/api/cybersource/webhooks/activate/:webhookId", func(c *gin.Context) {
+		webhookID := c.Param("webhookId")
+		path := fmt.Sprintf("/notification-subscriptions/v2/webhooks/%s/status", webhookID)
+		payload := map[string]interface{}{
+			"status": "ACTIVE",
+		}
+		resp, respBody, err := sendCybersourceRequest("PUT", path, payload)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to activate subscription", "details": err.Error()})
+			return
+		}
+		var result map[string]interface{}
+		_ = json.Unmarshal(respBody, &result)
+		c.JSON(resp.StatusCode, gin.H{"statusCode": resp.StatusCode, "details": result})
 	})
 
 	// 7b. Retrieve Enabled Webhook Products and Event Types

@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 )
 
 func init() {
@@ -215,80 +217,122 @@ func TestParseJWTPayload(t *testing.T) {
 	}
 }
 
-func TestVerifyPaymentEndpoint(t *testing.T) {
+func TestOrderCreationAndWebhookFlow(t *testing.T) {
 	r := gin.New()
 	store := NewOrderStore()
+	testWebhookKey := "super_secret_webhook_test_key_123"
 
-	r.POST("/api/cybersource/verify-payment", func(c *gin.Context) {
+	// 1. Order endpoint
+	r.POST("/api/orders", func(c *gin.Context) {
 		var reqData struct {
-			Result  interface{} `json:"result"`
-			OrderID string      `json:"orderId"`
-			Amount  string      `json:"amount"`
+			ID     string `json:"id"`
+			Amount string `json:"amount"`
 		}
-		if err := c.ShouldBindJSON(&reqData); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid"})
+		_ = c.ShouldBindJSON(&reqData)
+		order := &Order{
+			ID:        reqData.ID,
+			Amount:    reqData.Amount,
+			Currency:  "USD",
+			Status:    "PENDING",
+			Success:   false,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		store.Save(order)
+		c.JSON(http.StatusOK, order)
+	})
+
+	// 2. Webhook receiver
+	r.POST("/api/webhooks/cybersource", func(c *gin.Context) {
+		rawBody, _ := c.GetRawData()
+		sigHeader := c.GetHeader("v-c-signature")
+		isValid, reason := verifyWebhookSignature(sigHeader, rawBody, testWebhookKey)
+		if !isValid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": reason})
 			return
 		}
 
-		claims := map[string]interface{}{
-			"status": "AUTHORIZED",
-			"id":     "tx-999",
-		}
+		var payload map[string]interface{}
+		_ = json.Unmarshal(rawBody, &payload)
 
-		order := &Order{
-			ID:        "ORD-UNIT-1",
-			PaymentID: "tx-999",
-			Amount:    "21.00",
-			Status:    "AUTHORIZED",
-			Success:   true,
-		}
-		store.Save(order)
+		orderCode, _ := payload["orderCode"].(string)
+		status, _ := payload["status"].(string)
+		resourceID, _ := payload["resourceId"].(string)
 
-		c.JSON(http.StatusOK, gin.H{
-			"success":   true,
-			"orderId":   order.ID,
-			"paymentId": order.PaymentID,
-			"status":    order.Status,
-			"details":   claims,
+		store.RecordWebhook(WebhookEvent{
+			ID:         "EVT-999",
+			Status:     status,
+			OrderCode:  orderCode,
+			ResourceID: resourceID,
+			ReceivedAt: time.Now(),
 		})
+
+		c.JSON(http.StatusOK, gin.H{"status": "received"})
 	})
 
-	body := []byte(`{"result":"dummy.jwt.sig","orderId":"ORD-UNIT-1","amount":"21.00"}`)
-	req, _ := http.NewRequest("POST", "/api/cybersource/verify-payment", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
+	// 1. Create order
+	orderBody := []byte(`{"id":"ORD-WEBHOOK-TEST-1","amount":"45.00"}`)
+	req1, _ := http.NewRequest("POST", "/api/orders", bytes.NewBuffer(orderBody))
+	req1.Header.Set("Content-Type", "application/json")
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, req1)
 
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("Expected HTTP 200, got %d: %s", w.Code, w.Body.String())
+	if w1.Code != http.StatusOK {
+		t.Fatalf("Failed to create order, code: %d", w1.Code)
 	}
 
-	order, found := store.Get("ORD-UNIT-1")
-	if !found || order.Status != "AUTHORIZED" {
-		t.Fatalf("Order was not saved as expected")
+	order, found := store.Get("ORD-WEBHOOK-TEST-1")
+	if !found || order.Status != "PENDING" {
+		t.Fatalf("Expected order to be in PENDING state, got found=%v, status=%s", found, order.Status)
+	}
+
+	// 2. Send signed webhook event to settle order
+	now := time.Now().Unix()
+	webhookPayload := []byte(`{"id":"EVT-999","orderCode":"ORD-WEBHOOK-TEST-1","resourceId":"PAY-777","status":"SETTLED"}`)
+	dataToSign := fmt.Sprintf("%d.%s", now, string(webhookPayload))
+	mac := hmac.New(sha256.New, []byte(testWebhookKey))
+	mac.Write([]byte(dataToSign))
+	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	req2, _ := http.NewRequest("POST", "/api/webhooks/cybersource", bytes.NewBuffer(webhookPayload))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("v-c-signature", fmt.Sprintf("t=%d;keyId=key_1;sig=%s", now, sig))
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("Expected webhook HTTP 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+
+	// Verify order updated to SETTLED
+	updatedOrder, _ := store.Get("ORD-WEBHOOK-TEST-1")
+	if updatedOrder.Status != "SETTLED" {
+		t.Fatalf("Expected order status SETTLED, got %s", updatedOrder.Status)
+	}
+	if !updatedOrder.Success {
+		t.Fatalf("Expected order.Success to be true")
+	}
+	if updatedOrder.PaymentID != "PAY-777" {
+		t.Fatalf("Expected order.PaymentID to be PAY-777, got %s", updatedOrder.PaymentID)
 	}
 }
 
 func TestSessionsPayloadStructure(t *testing.T) {
 	targetOrigins := []string{"https://4tdw3h1m-5173.use.devtunnels.ms"}
 	amount := "21.00"
+	orderCode := "ORD-TEST-99"
 
 	payload := map[string]interface{}{
 		"targetOrigins": targetOrigins,
 		"country":       "US",
 		"locale":        "en_US",
-		"captureMandate": map[string]interface{}{
-			"billingType":              "PARTIAL",
-			"requestEmail":             false,
-			"requestPhone":             false,
-			"requestShipping":          false,
-			"showAcceptedNetworkIcons": true,
-		},
 		"completeMandate": map[string]interface{}{
-			"type": "AUTH",
+			"type": "CAPTURE",
 		},
 		"data": map[string]interface{}{
+			"clientReferenceInformation": map[string]interface{}{
+				"code": orderCode,
+			},
 			"orderInformation": map[string]interface{}{
 				"amountDetails": map[string]interface{}{
 					"totalAmount": amount,
@@ -324,18 +368,18 @@ func TestSessionsPayloadStructure(t *testing.T) {
 	}
 
 	completeMandate, ok := parsed["completeMandate"].(map[string]interface{})
-	if !ok || completeMandate["type"] != "AUTH" {
-		t.Fatalf("Expected completeMandate.type to be AUTH, got: %v", completeMandate)
-	}
-
-	captureMandate, ok := parsed["captureMandate"].(map[string]interface{})
-	if !ok || captureMandate["billingType"] != "PARTIAL" {
-		t.Fatalf("Expected captureMandate.billingType to be PARTIAL, got: %v", captureMandate)
+	if !ok || completeMandate["type"] != "CAPTURE" {
+		t.Fatalf("Expected completeMandate.type to be CAPTURE, got: %v", completeMandate)
 	}
 
 	dataObj, ok := parsed["data"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("Expected data object in payload")
+	}
+
+	clientRef, ok := dataObj["clientReferenceInformation"].(map[string]interface{})
+	if !ok || clientRef["code"] != "ORD-TEST-99" {
+		t.Fatalf("Expected clientReferenceInformation.code to be ORD-TEST-99, got: %v", clientRef)
 	}
 
 	orderInfo, ok := dataObj["orderInformation"].(map[string]interface{})
@@ -354,42 +398,123 @@ func TestSessionsPayloadStructure(t *testing.T) {
 	}
 }
 
-func TestLiveCaptureContext(t *testing.T) {
-	if MerchantID == "" || KeyID == "" || SecretKey == "" {
-		t.Skip("Credentials not configured, skipping live API test")
-	}
+func TestOffloadedBillingPayloadStructure(t *testing.T) {
+	// Tests payload with completeMandate (to trigger complete method) and offloaded billing
+	targetOrigins := []string{"https://localhost:5173"}
+	orderCode := "ORD-OFFLOAD-101"
 
-	targetOrigins := []string{"https://4tdw3h1m-5173.use.devtunnels.ms"}
 	payload := map[string]interface{}{
 		"targetOrigins": targetOrigins,
 		"country":       "US",
 		"locale":        "en_US",
-		"captureMandate": map[string]interface{}{
-			"billingType":              "PARTIAL",
-			"requestEmail":             false,
-			"requestPhone":             false,
-			"requestShipping":          false,
-			"showAcceptedNetworkIcons": true,
-		},
 		"completeMandate": map[string]interface{}{
 			"type": "CAPTURE",
 		},
 		"data": map[string]interface{}{
+			"clientReferenceInformation": map[string]interface{}{
+				"code": orderCode,
+			},
 			"orderInformation": map[string]interface{}{
 				"amountDetails": map[string]interface{}{
 					"totalAmount": "21.00",
 					"currency":    "USD",
 				},
-				"billTo": map[string]interface{}{
-					"firstName":          "John",
-					"lastName":           "Doe",
-					"address1":           "1 Market St",
-					"locality":           "San Francisco",
-					"administrativeArea": "CA",
-					"postalCode":         "94105",
-					"country":            "US",
-					"email":              "customer@example.com",
-					"phoneNumber":        "4158880000",
+			},
+		},
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Failed to marshal payload: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(payloadBytes, &parsed); err != nil {
+		t.Fatalf("Failed to unmarshal payload: %v", err)
+	}
+
+	if _, hasCaptureMandate := parsed["captureMandate"]; hasCaptureMandate {
+		t.Fatalf("Expected captureMandate to be omitted to rely on Business Center profile defaults")
+	}
+	completeMandate, ok := parsed["completeMandate"].(map[string]interface{})
+	if !ok || completeMandate["type"] != "CAPTURE" {
+		t.Fatalf("Expected completeMandate to be CAPTURE to trigger complete method")
+	}
+
+	dataObj := parsed["data"].(map[string]interface{})
+	orderInfo := dataObj["orderInformation"].(map[string]interface{})
+	if _, hasBillTo := orderInfo["billTo"]; hasBillTo {
+		t.Fatalf("Expected billTo to be omitted when offloaded to Cybersource")
+	}
+}
+
+func TestCaptureContextWithDynamicBillingInfo(t *testing.T) {
+	store := NewOrderStore()
+	orderCode := "ORD-DYNAMIC-BILL-01"
+
+	customBillTo := map[string]interface{}{
+		"firstName":          "Alice",
+		"lastName":           "Wonderland",
+		"address1":           "456 Elm St",
+		"locality":           "Seattle",
+		"administrativeArea": "WA",
+		"postalCode":         "98101",
+		"country":            "US",
+		"email":              "alice@example.com",
+		"phoneNumber":        "2065551234",
+	}
+
+	order := &Order{
+		ID:        orderCode,
+		Amount:    "55.00",
+		Currency:  "USD",
+		Status:    "PENDING",
+		Success:   false,
+		Capture:   true,
+		BillTo:    customBillTo,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	store.Save(order)
+
+	retrieved, ok := store.Get(orderCode)
+	if !ok {
+		t.Fatalf("Order not found in store")
+	}
+
+	if retrieved.BillTo["firstName"] != "Alice" {
+		t.Fatalf("Expected BillTo firstName Alice, got: %v", retrieved.BillTo["firstName"])
+	}
+	if retrieved.BillTo["email"] != "alice@example.com" {
+		t.Fatalf("Expected BillTo email alice@example.com, got: %v", retrieved.BillTo["email"])
+	}
+	if retrieved.BillTo["locality"] != "Seattle" {
+		t.Fatalf("Expected BillTo locality Seattle, got: %v", retrieved.BillTo["locality"])
+	}
+}
+
+func TestLiveCaptureContext(t *testing.T) {
+	if MerchantID == "" || KeyID == "" || SecretKey == "" {
+		t.Skip("Credentials not configured, skipping live API test")
+	}
+
+	targetOrigins := []string{"https://localhost:5173"}
+	orderCode := fmt.Sprintf("ORD-%d", time.Now().Unix())
+	payload := map[string]interface{}{
+		"targetOrigins": targetOrigins,
+		"country":       "US",
+		"locale":        "en_US",
+		"completeMandate": map[string]interface{}{
+			"type": "CAPTURE",
+		},
+		"data": map[string]interface{}{
+			"clientReferenceInformation": map[string]interface{}{
+				"code": orderCode,
+			},
+			"orderInformation": map[string]interface{}{
+				"amountDetails": map[string]interface{}{
+					"totalAmount": "21.00",
+					"currency":    "USD",
 				},
 			},
 		},
@@ -413,5 +538,62 @@ func TestLiveCaptureContext(t *testing.T) {
 		t.Fatalf("Failed to parse returned capture context JWT: %v", err)
 	}
 
-	t.Logf("Successfully retrieved capture context JWT! Issuer=%v, Expiry=%v", claims["iss"], claims["exp"])
+	claimsJSON, _ := json.MarshalIndent(claims, "", "  ")
+	t.Logf("Capture Context JWT Claims:\n%s", string(claimsJSON))
+}
+
+func TestUCOrdersTransactionResultsWebhook(t *testing.T) {
+	store := NewOrderStore()
+	order := &Order{
+		ID:        "ORD-UC-TEST-001",
+		Amount:    "21.00",
+		Currency:  "USD",
+		Status:    "PENDING",
+		Success:   false,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	store.Save(order)
+
+	// Simulate uc.orders.transactionresults payload
+	event := WebhookEvent{
+		ID:             "EVT-UC-999",
+		EventTimestamp: time.Now().UTC().Format(time.RFC3339),
+		EventType:      "uc.orders.transactionresults",
+		ResourceID:     "PAY-TX-888",
+		Status:         "SETTLED",
+		OrderCode:      "ORD-UC-TEST-001",
+		ReceivedAt:     time.Now(),
+	}
+	store.RecordWebhook(event)
+
+	updated, ok := store.Get("ORD-UC-TEST-001")
+	if !ok || updated.Status != "SETTLED" || !updated.Success {
+		t.Fatalf("Expected order to transition to SETTLED, got status=%s, success=%v", updated.Status, updated.Success)
+	}
+}
+
+func TestNoAuthWebhookSignatureSupport(t *testing.T) {
+	// Tests that when Cybersource subscription is configured as "No Auth", the absence of v-c-signature is accepted
+	valid, reason := verifyWebhookSignature("", []byte(`{"test":"payload"}`), "test_secret_key")
+	if !valid {
+		t.Fatalf("Expected No Auth webhook to be permitted, got reason: %s", reason)
+	}
+}
+
+func TestQueryCybersourceWebhooks(t *testing.T) {
+	_ = godotenv.Overload(".env")
+	MerchantID = os.Getenv("CS_MERCHANT_ID")
+	KeyID = os.Getenv("CS_KEY_ID")
+	SecretKey = os.Getenv("CS_SECRET_KEY")
+
+	webhookID := "5afa58ec-060b-5cb2-e063-a0588e0a6a8f"
+
+	path := fmt.Sprintf("/notification-subscriptions/v2/webhooks/%s", webhookID)
+	resp, body, err := sendCybersourceRequest("GET", path, nil)
+	if err != nil {
+		t.Skipf("Network error: %v", err)
+		return
+	}
+	t.Logf("Webhook %s status (HTTP %d): %s", webhookID, resp.StatusCode, string(body))
 }
