@@ -60,7 +60,7 @@ function App() {
         if (res && typeof res.catch === 'function') {
           res.catch(() => {});
         }
-      } catch (e) {
+      } catch {
         // Suppress CyberSource internal "Cannot read properties of null (reading 'lastChild')"
       }
     }
@@ -70,7 +70,7 @@ function App() {
         if (res && typeof res.catch === 'function') {
           res.catch(() => {});
         }
-      } catch (e) {
+      } catch {
         // Suppress CyberSource client destroy error
       }
     }
