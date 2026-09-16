@@ -26,15 +26,7 @@ interface CartItem {
 }
 
 function App() {
-  const [cart, setCart] = useState<CartItem[]>([
-    {
-      id: 'prod_1',
-      name: 'Sample Item',
-      price: 21.00,
-      quantity: 1,
-      image: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800&q=80',
-    },
-  ]);
+  const [cart, setCart] = useState<CartItem[]>([  ]);
   const [loading, setLoading] = useState(false);
   const [checkoutMounted, setCheckoutMounted] = useState(false);
   const [error, setError] = useState('');
@@ -58,7 +50,7 @@ function App() {
       try {
         const res = checkout.destroy?.();
         if (res && typeof res.catch === 'function') {
-          res.catch(() => {});
+          res.catch(() => { });
         }
       } catch {
         // Suppress CyberSource internal "Cannot read properties of null (reading 'lastChild')"
@@ -68,7 +60,7 @@ function App() {
       try {
         const res = client.destroy?.();
         if (res && typeof res.catch === 'function') {
-          res.catch(() => {});
+          res.catch(() => { });
         }
       } catch {
         // Suppress CyberSource client destroy error
@@ -158,7 +150,8 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           amount: total.toFixed(2),
-          targetOrigin: 'https://localhost:5173',
+          target_origin: 'https://localhost:5173',
+          capture_type: 'PREFER_AUTH'
         }),
       });
 
@@ -261,7 +254,7 @@ function App() {
           setMerchantId(data.merchantId);
         }
       })
-      .catch(() => {});
+      .catch(() => { });
 
     return () => {
       cleanupCheckout();

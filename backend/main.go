@@ -197,7 +197,7 @@ var mockCart = []CartItem{
 	{
 		ID:       "prod_1",
 		Name:     "Sample Item",
-		Price:    21.00,
+		Price:    200.00,
 		Quantity: 1,
 		Image:    "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800&q=80",
 	},
@@ -600,9 +600,9 @@ func main() {
 	r.POST("/api/cybersource/capture-context", func(c *gin.Context) {
 		var reqData struct {
 			Amount       string                 `json:"amount"`
-			TargetOrigin string                 `json:"targetOrigin"`
-			CaptureType  string                 `json:"captureType"` // "CAPTURE" or "AUTH"
-			OrderID      string                 `json:"orderId"`
+			TargetOrigin string                 `json:"target_origin"`
+			CaptureType  string                 `json:"capture_type"` // "CAPTURE" or "AUTH"
+			OrderID      string                 `json:"order_id"`
 			BillTo       map[string]interface{} `json:"billTo"`
 		}
 		if err := c.ShouldBindJSON(&reqData); err != nil {
@@ -619,7 +619,7 @@ func main() {
 		// Strictly use only https://localhost:5173 as the target origin
 		targetOrigins := []string{"https://localhost:5173"}
 
-		amount := "21.00"
+		amount := "200.00"
 		if reqData.Amount != "" && reqData.Amount != "0.00" {
 			amount = reqData.Amount
 		}
@@ -687,7 +687,9 @@ func main() {
 			"country":       sessionCountry,
 			"locale":        "en_US",
 			"completeMandate": map[string]interface{}{
-				"type": captureType,
+				"type":                   captureType,
+				"decisionManager":        true,
+				"consumerAuthentication": "3DS",
 			},
 			"data": map[string]interface{}{
 				"clientReferenceInformation": map[string]interface{}{
