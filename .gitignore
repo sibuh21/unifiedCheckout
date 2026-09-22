@@ -13,3 +13,12 @@ frontend/node_modules/
 # Build artifacts
 dist/
 frontend/dist/
+backend/webhook
+backend/server
+
+# Certificates & Private Keys
+certs/
+backend/certs/
+*.pem
+*.key
+*.crt

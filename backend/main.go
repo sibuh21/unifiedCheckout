@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -18,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"unified-checkout-backend/internal/cybersource"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -181,7 +184,32 @@ var (
 	WebhookKey   string
 	Host         = "apitest.cybersource.com" // Sandbox environment
 	orderStore   = NewOrderStore()
+	csClient     *cybersource.Client
+	mleKeyID     string
+	mleKeyPath   string
+	mlePrivKey   *rsa.PrivateKey
 )
+
+func loadMLEPrivateKey() {
+	mleKeyID = os.Getenv("CS_MLE_KEY_ID")
+	mleKeyPath = os.Getenv("CS_MLE_KEY_PATH")
+	if mleKeyPath == "" {
+		for _, p := range []string{"certs/mle_private.pem", "backend/certs/mle_private.pem"} {
+			if _, err := os.Stat(p); err == nil {
+				mleKeyPath = p
+				break
+			}
+		}
+	}
+	if mleKeyPath != "" {
+		if key, err := cybersource.LoadPrivateKey(mleKeyPath); err == nil {
+			mlePrivKey = key
+			log.Printf("[MLE] Loaded Message-Level Encryption private key from %s (KeyID: %s)", mleKeyPath, mleKeyID)
+		} else {
+			log.Printf("[MLE] Warning: Failed to load MLE private key from %s: %v", mleKeyPath, err)
+		}
+	}
+}
 
 func init() {
 	_ = godotenv.Load()
@@ -191,6 +219,7 @@ func init() {
 	SecretKey = os.Getenv("CS_SECRET_KEY")
 	WebhookKeyID = os.Getenv("CS_WEBHOOK_KEY_ID")
 	WebhookKey = os.Getenv("CS_WEBHOOK_KEY")
+	loadMLEPrivateKey()
 }
 
 var mockCart = []CartItem{
@@ -528,12 +557,14 @@ func main() {
 	SecretKey = os.Getenv("CS_SECRET_KEY")
 	WebhookKeyID = os.Getenv("CS_WEBHOOK_KEY_ID")
 	WebhookKey = os.Getenv("CS_WEBHOOK_KEY")
+	loadMLEPrivateKey()
 
 	log.Printf("==================================================")
 	log.Printf("Starting Cybersource Unified Checkout Backend")
 	log.Printf("Active Merchant ID: %s", MerchantID)
 	log.Printf("Active Key ID:      %s", KeyID)
 	log.Printf("Webhook Key ID:     %s", WebhookKeyID)
+	log.Printf("MLE Key ID:         %s", mleKeyID)
 	log.Printf("==================================================")
 
 	r := gin.Default()
@@ -719,6 +750,20 @@ func main() {
 			"orderId":       orderCode,
 			"targetOrigins": targetOrigins,
 		}
+		if claims, err := parseJWTPayload(string(respBody)); err == nil {
+			if ctxArr, ok := claims["ctx"].([]interface{}); ok && len(ctxArr) > 0 {
+				if ctxMap, ok := ctxArr[0].(map[string]interface{}); ok {
+					if dataMap, ok := ctxMap["data"].(map[string]interface{}); ok {
+						if lib, ok := dataMap["clientLibrary"].(string); ok && lib != "" {
+							respData["clientLibrary"] = lib
+						}
+						if integrity, ok := dataMap["clientLibraryIntegrity"].(string); ok && integrity != "" {
+							respData["clientLibraryIntegrity"] = integrity
+						}
+					}
+				}
+			}
+		}
 		if billToData != nil {
 			respData["billTo"] = billToData
 		}
@@ -758,7 +803,7 @@ func main() {
 	})
 
 	// 3. Webhook Receiver: Handles Cybersource Notification Service callbacks
-	r.POST("/api/webhooks/cybersource", func(c *gin.Context) {
+	handleCybersourceWebhook := func(c *gin.Context) {
 		rawBody, err := io.ReadAll(c.Request.Body)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read webhook payload"})
@@ -779,11 +824,48 @@ func main() {
 			return
 		}
 
+		// Check if the entire raw body is a compact JWE string (Message-Level Encryption)
+		bodyToParse := rawBody
+		rawBodyStr := strings.TrimSpace(string(rawBody))
+		if cybersource.IsJWE(rawBodyStr) {
+			if mlePrivKey == nil {
+				log.Printf("[Webhook MLE] Received encrypted JWE payload, but server private key is not loaded (check CS_MLE_KEY_PATH)")
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "MLE private key not configured on server"})
+				return
+			}
+			decrypted, err := cybersource.DecryptJWE(rawBodyStr, mlePrivKey)
+			if err != nil {
+				log.Printf("[Webhook MLE] Failed to decrypt JWE: %v", err)
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to decrypt JWE payload", "details": err.Error()})
+				return
+			}
+			log.Printf("[Webhook MLE] Successfully decrypted JWE compact payload (%d bytes)", len(decrypted))
+			bodyToParse = decrypted
+		}
+
 		var payload map[string]interface{}
-		if err := json.Unmarshal(rawBody, &payload); err != nil {
+		if err := json.Unmarshal(bodyToParse, &payload); err != nil {
 			log.Printf("[Webhook] Failed to unmarshal body: %v", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON format"})
 			return
+		}
+
+		// Check if inner 'payload' field is an encrypted JWE string
+		if innerJWE, ok := payload["payload"].(string); ok && cybersource.IsJWE(innerJWE) {
+			if mlePrivKey != nil {
+				decryptedInner, err := cybersource.DecryptJWE(innerJWE, mlePrivKey)
+				if err == nil {
+					var innerMap map[string]interface{}
+					if err := json.Unmarshal(decryptedInner, &innerMap); err == nil {
+						payload["payload"] = innerMap
+						log.Printf("[Webhook MLE] Successfully decrypted inner JWE payload field (%d bytes)", len(decryptedInner))
+					}
+				} else {
+					log.Printf("[Webhook MLE] Failed to decrypt inner JWE payload: %v", err)
+				}
+			} else {
+				log.Printf("[Webhook MLE] Inner payload is JWE, but server private key is not configured")
+			}
 		}
 
 		// Extract notification fields
@@ -884,7 +966,10 @@ func main() {
 			"eventId":  eventID,
 			"verified": isValid,
 		})
-	})
+	}
+
+	r.POST("/api/webhooks/cybersource", handleCybersourceWebhook)
+	r.POST("/api/cybersource/webhooks/events", handleCybersourceWebhook)
 
 	// 4. Query Order & Webhook Status
 	r.GET("/api/orders/:orderId", func(c *gin.Context) {

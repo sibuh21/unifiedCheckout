@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"unified-checkout-backend/internal/cybersource"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -175,6 +177,86 @@ func TestWebhookEndpointWithGin(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("Expected HTTP 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestWebhookEndpointWithEncryptedJWE(t *testing.T) {
+	MerchantID = "test_merchant"
+	WebhookKey = "test_webhook_key_super_secret"
+
+	// 1. Generate test MLE keys
+	privPEM, _, _, err := cybersource.GenerateMLEKeyPair("test_merchant", "test_key")
+	if err != nil {
+		t.Fatalf("GenerateMLEKeyPair failed: %v", err)
+	}
+	privKey, err := cybersource.LoadPrivateKey(string(privPEM))
+	if err != nil {
+		t.Fatalf("LoadPrivateKey failed: %v", err)
+	}
+	mlePrivKey = privKey
+
+	// 2. Encrypt test payload as JWE
+	innerJSON := []byte(`{"id":"evt_jwe_123","eventType":"uc.orders.transactionresults","status":"SETTLED","orderCode":"ORD-JWE-001"}`)
+	jweString, err := cybersource.EncryptJWE(innerJSON, &privKey.PublicKey)
+	if err != nil {
+		t.Fatalf("EncryptJWE failed: %v", err)
+	}
+
+	r := gin.New()
+	r.POST("/api/webhooks/cybersource", func(c *gin.Context) {
+		rawBody, _ := c.GetRawData()
+		sigHeader := c.GetHeader("v-c-signature")
+		isValid, reason := verifyWebhookSignature(sigHeader, rawBody, WebhookKey)
+		if !isValid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": reason})
+			return
+		}
+
+		bodyToParse := rawBody
+		if cybersource.IsJWE(string(rawBody)) {
+			decrypted, err := cybersource.DecryptJWE(string(rawBody), mlePrivKey)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to decrypt JWE payload"})
+				return
+			}
+			bodyToParse = decrypted
+		}
+
+		var payload map[string]interface{}
+		_ = json.Unmarshal(bodyToParse, &payload)
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "received",
+			"id":        payload["id"],
+			"orderCode": payload["orderCode"],
+		})
+	})
+
+	now := time.Now().Unix()
+	body := []byte(jweString)
+
+	dataToSign := fmt.Sprintf("%d.%s", now, string(body))
+	mac := hmac.New(sha256.New, []byte(WebhookKey))
+	mac.Write([]byte(dataToSign))
+	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	req, _ := http.NewRequest("POST", "/api/webhooks/cybersource", bytes.NewBuffer(body))
+	req.Header.Set("v-c-signature", fmt.Sprintf("t=%s;keyId=test_key;sig=%s", strconv.FormatInt(now, 10), sig))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected HTTP 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var res map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if res["orderCode"] != "ORD-JWE-001" {
+		t.Errorf("Expected orderCode ORD-JWE-001, got %v", res["orderCode"])
+	}
+	if res["id"] != "evt_jwe_123" {
+		t.Errorf("Expected id evt_jwe_123, got %v", res["id"])
 	}
 }
 

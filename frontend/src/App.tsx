@@ -25,6 +25,58 @@ interface CartItem {
   image: string;
 }
 
+interface ClientLibraryConfig {
+  clientLibrary: string;
+  clientLibraryIntegrity?: string;
+}
+
+/**
+ * Extracts the dynamic Unified Checkout clientLibrary URL and SRI hash from the signed Capture Context JWT.
+ * In Cybersource Unified Checkout, each session's Capture Context JWT specifies the exact client library script.
+ */
+function extractClientLibraryFromCaptureContext(jwt: string): ClientLibraryConfig | null {
+  try {
+    const parts = jwt.split('.');
+    if (parts.length < 2) return null;
+    const base64Url = parts[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(
+      atob(base64)
+        .split('')
+        .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    const payload = JSON.parse(jsonPayload);
+
+    let clientLibrary = '';
+    let clientLibraryIntegrity: string | undefined = undefined;
+
+    if (Array.isArray(payload.ctx) && payload.ctx.length > 0) {
+      for (const item of payload.ctx) {
+        if (item?.data?.clientLibrary) {
+          clientLibrary = item.data.clientLibrary;
+          clientLibraryIntegrity = item.data.clientLibraryIntegrity;
+          break;
+        }
+      }
+    } else if (payload.ctx?.data?.clientLibrary) {
+      clientLibrary = payload.ctx.data.clientLibrary;
+      clientLibraryIntegrity = payload.ctx.data.clientLibraryIntegrity;
+    } else if (payload.clientLibrary) {
+      clientLibrary = payload.clientLibrary;
+      clientLibraryIntegrity = payload.clientLibraryIntegrity;
+    }
+
+    if (clientLibrary) {
+      return { clientLibrary, clientLibraryIntegrity };
+    }
+    return null;
+  } catch (err) {
+    console.warn('Failed to parse Capture Context JWT for clientLibrary:', err);
+    return null;
+  }
+}
+
 function App() {
   const [cart, setCart] = useState<CartItem[]>([  ]);
   const [loading, setLoading] = useState(false);
@@ -81,17 +133,34 @@ function App() {
     setCheckoutMounted(false);
   }, []);
 
-  const ensureVASLoaded = useCallback(async (): Promise<any> => {
-    if (window.VAS?.UnifiedCheckout) {
+  const ensureVASLoaded = useCallback(async (clientLibraryUrl: string, integrity?: string): Promise<any> => {
+    const existingScript = document.getElementById('cybersource-unified-checkout') as HTMLScriptElement | null;
+    
+    // If library was already loaded from this exact URL and VAS is available, reuse it
+    if (existingScript && existingScript.src === clientLibraryUrl && window.VAS?.UnifiedCheckout) {
       return window.VAS;
     }
 
+    // If an existing script had a different URL, remove it so the version matching this Capture Context is loaded
+    if (existingScript && existingScript.src !== clientLibraryUrl) {
+      existingScript.remove();
+      try {
+        delete (window as any).VAS;
+      } catch {
+        (window as any).VAS = undefined;
+      }
+    }
+
     return new Promise((resolve, reject) => {
-      let script = document.getElementById('cybersource-unified-checkout') as HTMLScriptElement;
+      let script = document.getElementById('cybersource-unified-checkout') as HTMLScriptElement | null;
       if (!script) {
         script = document.createElement('script');
         script.id = 'cybersource-unified-checkout';
-        script.src = 'https://apitest.cybersource.com/uc/v1/assets/1.0.0/UnifiedCheckout.js';
+        script.src = clientLibraryUrl;
+        if (integrity) {
+          script.integrity = integrity;
+          script.crossOrigin = 'anonymous';
+        }
         script.async = true;
         document.head.appendChild(script);
       }
@@ -112,18 +181,18 @@ function App() {
 
       script.onerror = () => {
         clearInterval(checkInterval);
-        reject(new Error('Failed to load Cybersource UnifiedCheckout.js library'));
+        reject(new Error(`Failed to load Cybersource Unified Checkout library from ${clientLibraryUrl}`));
       };
 
-      // Timeout after 8 seconds
+      // Timeout after 10 seconds
       setTimeout(() => {
         clearInterval(checkInterval);
         if (window.VAS?.UnifiedCheckout) {
           resolve(window.VAS);
         } else {
-          reject(new Error('Timed out waiting for VAS.UnifiedCheckout to initialize'));
+          reject(new Error(`Timed out waiting for VAS.UnifiedCheckout to initialize from ${clientLibraryUrl}`));
         }
-      }, 8000);
+      }, 10000);
     });
   }, []);
 
@@ -181,24 +250,34 @@ function App() {
       setSessionJwt(sessionJWT);
       setOrderId(currentOrderId);
 
-      // 2. Ensure VAS library is ready
-      const vas = await ensureVASLoaded();
+      // 2. Extract clientLibrary and clientLibraryIntegrity from the Capture Context JWT (or backend response)
+      const extractedConfig = extractClientLibraryFromCaptureContext(sessionJWT);
+      const clientLibraryUrl = data.clientLibrary || extractedConfig?.clientLibrary || 'https://apitest.cybersource.com/uc/v1/assets/1.0.0/UnifiedCheckout.js';
+      const clientLibraryIntegrity = data.clientLibraryIntegrity || extractedConfig?.clientLibraryIntegrity;
+
+      console.log('[CaptureContext] Loading Unified Checkout JS library:', {
+        url: clientLibraryUrl,
+        integrity: clientLibraryIntegrity,
+      });
+
+      // 3. Ensure VAS library is dynamically loaded using the Capture Context
+      const vas = await ensureVASLoaded(clientLibraryUrl, clientLibraryIntegrity);
       if (!vas?.UnifiedCheckout) {
         throw new Error('VAS.UnifiedCheckout function not found');
       }
 
-      // 3. Initialize SDK by calling VAS.UnifiedCheckout(sessionJWT)
+      // 4. Initialize SDK by calling VAS.UnifiedCheckout(sessionJWT)
       client = await vas.UnifiedCheckout(sessionJWT);
       activeClientRef.current = client;
 
-      // 4. Create checkout instance (autoProcessing enables direct browser payment collection)
+      // 5. Create checkout instance (autoProcessing enables direct browser payment collection)
       checkout = await client.createCheckout({ autoProcessing: true });
       activeCheckoutRef.current = checkout;
 
       setLoading(false);
       setCheckoutMounted(true);
 
-      // 5. Always Mount in Sidebar Mode
+      // 6. Always Mount in Sidebar Mode
       const result = await checkout.mount('#payment-buttons');
 
       console.log('Unified Checkout payment submission result:', result);
