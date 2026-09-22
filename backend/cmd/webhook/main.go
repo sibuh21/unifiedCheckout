@@ -60,6 +60,8 @@ func main() {
 		cmdGet(os.Args[2:])
 	case "update":
 		cmdUpdate(os.Args[2:])
+	case "activate":
+		cmdActivate(os.Args[2:])
 	case "delete":
 		cmdDelete(os.Args[2:])
 	case "generate-key":
@@ -84,8 +86,9 @@ Commands:
                                               Create a new webhook subscription
   list                                        List all webhook subscriptions
   get       -id <webhookId>                   Get subscription details
-  update    -id <webhookId> [-url <url>] [-health-url <url>] [-status <ACTIVE|INACTIVE>]
-                                              Update a subscription
+  update    -id <webhookId> [-url <url>] [-health-url <url>] [-status <ACTIVE|INACTIVE>] [-include-payments-auth] [-include-all-payments]
+                                              Update a subscription (optionally adds payments.payments.authorized)
+  activate  -id <webhookId>                   Reactivate a suspended webhook subscription
   delete    -id <webhookId>                   Delete a subscription
   generate-key                                Generate a new digital signature key via KMS
   generate-mle-key                            Generate & register MLE certificate with KMS
@@ -208,6 +211,8 @@ func cmdUpdate(args []string) {
 	webhookURL := fs.String("url", "", "New webhook URL")
 	healthURL := fs.String("health-url", "", "New health check URL")
 	status := fs.String("status", "", "New status (ACTIVE or INACTIVE)")
+	includePaymentsAuth := fs.Bool("include-payments-auth", false, "Include payments.payments.authorized alongside unifiedCheckout")
+	includeAllPayments := fs.Bool("include-all-payments", false, "Include payments.payments.authorized and payments.payments.capture")
 	fs.Parse(args)
 
 	if *id == "" {
@@ -227,12 +232,46 @@ func cmdUpdate(args []string) {
 		payload["status"] = strings.ToUpper(*status)
 	}
 
+	if *includePaymentsAuth || *includeAllPayments {
+		paymentEvents := []string{"payments.payments.authorized"}
+		if *includeAllPayments {
+			paymentEvents = append(paymentEvents, "payments.payments.capture")
+		}
+		payload["products"] = []map[string]interface{}{
+			{
+				"productId":  "unifiedCheckout",
+				"eventTypes": []string{"uc.orders.transactionresults"},
+			},
+			{
+				"productId":  "payments",
+				"eventTypes": paymentEvents,
+			},
+		}
+	}
+
 	if len(payload) == 1 {
-		log.Fatal("At least one of -url, -health-url, or -status must be provided")
+		log.Fatal("At least one of -url, -health-url, -status, -include-payments-auth, or -include-all-payments must be provided")
 	}
 
 	path := fmt.Sprintf("/notification-subscriptions/v2/webhooks/%s", *id)
 	resp, body, err := client.SendRequest("PATCH", path, payload)
+	handleResponse(resp, body, err)
+}
+
+func cmdActivate(args []string) {
+	fs := flag.NewFlagSet("activate", flag.ExitOnError)
+	id := fs.String("id", "", "Webhook subscription ID (required)")
+	fs.Parse(args)
+
+	if *id == "" {
+		log.Fatal("Missing required flag: -id")
+	}
+
+	path := fmt.Sprintf("/notification-subscriptions/v2/webhooks/%s/status", *id)
+	payload := map[string]interface{}{
+		"status": "ACTIVE",
+	}
+	resp, body, err := client.SendRequest("PUT", path, payload)
 	handleResponse(resp, body, err)
 }
 
