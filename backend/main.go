@@ -665,24 +665,7 @@ func main() {
 			orderCode = fmt.Sprintf("ORD-%d", time.Now().Unix())
 		}
 
-		// Billing information: offloaded to Cybersource by default via billingType: "FULL".
-		// If optional pre-fill data is provided in reqData.BillTo, pass it to Cybersource;
-		// otherwise, Cybersource renders empty inputs for the customer directly in its hosted iframe.
-		var billToData map[string]interface{}
 		sessionCountry := "US"
-
-		if reqData.BillTo != nil && len(reqData.BillTo) > 0 {
-			billToData = make(map[string]interface{})
-			for k, v := range reqData.BillTo {
-				if strVal, ok := v.(string); ok && strings.TrimSpace(strVal) != "" {
-					billToData[k] = strings.TrimSpace(strVal)
-				}
-			}
-			if c, ok := billToData["country"].(string); ok && len(strings.TrimSpace(c)) == 2 {
-				sessionCountry = strings.ToUpper(strings.TrimSpace(c))
-				billToData["country"] = sessionCountry
-			}
-		}
 
 		// Save initial order in OrderStore with PENDING status
 		initialOrder := &Order{
@@ -692,13 +675,12 @@ func main() {
 			Status:    "PENDING",
 			Success:   false,
 			Capture:   captureType == "CAPTURE",
-			BillTo:    billToData,
 			CreatedAt: time.Now(),
 			UpdatedAt: time.Now(),
 		}
 		orderStore.Save(initialOrder)
-		log.Printf("[CaptureContext] Initialized order %s (Amount: %s USD, CompleteMandate: %s, BillingOffloaded: %v)",
-			orderCode, amount, captureType, billToData == nil)
+		log.Printf("[CaptureContext] Initialized order %s (Amount: %s USD)",
+			orderCode, amount)
 
 		path := "/uc/v1/sessions"
 		orderInfo := map[string]interface{}{
@@ -707,9 +689,6 @@ func main() {
 				"currency":    "USD",
 			},
 		}
-		if len(billToData) > 0 {
-			orderInfo["billTo"] = billToData
-		}
 
 		// Field collection (Billing Address, Phone, Email) is fully delegated to the Cybersource profile.
 		// completeMandate triggers Unified Checkout's complete method, emitting uc.orders.transactionresults.
@@ -717,11 +696,6 @@ func main() {
 			"targetOrigins": targetOrigins,
 			"country":       sessionCountry,
 			"locale":        "en_US",
-			"completeMandate": map[string]interface{}{
-				"type":                   captureType,
-				"decisionManager":        true,
-				"consumerAuthentication": "3DS",
-			},
 			"data": map[string]interface{}{
 				"clientReferenceInformation": map[string]interface{}{
 					"code": orderCode,
@@ -764,9 +738,7 @@ func main() {
 				}
 			}
 		}
-		if billToData != nil {
-			respData["billTo"] = billToData
-		}
+
 		c.JSON(http.StatusOK, respData)
 	})
 
