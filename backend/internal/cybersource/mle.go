@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -125,11 +126,41 @@ func LoadPrivateKey(pathOrPEM string) (*rsa.PrivateKey, error) {
 // JWE compact serialization consists of 5 base64url-encoded parts separated by 4 dots.
 func IsJWE(s string) bool {
 	s = strings.TrimSpace(s)
-	if len(s) < 10 {
+	if len(s) < 10 || strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") || strings.HasPrefix(s, "\"") {
 		return false
 	}
 	parts := strings.Split(s, ".")
-	return len(parts) == 5 && !strings.ContainsAny(s, " \r\n\t")
+	if len(parts) != 5 {
+		return false
+	}
+	// Check for invalid characters in any segment (Base64URL only: [A-Za-z0-9_-])
+	for _, p := range parts {
+		if len(p) == 0 {
+			return false
+		}
+		for i := 0; i < len(p); i++ {
+			c := p[i]
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+				return false
+			}
+		}
+	}
+	// Validate that parts[0] decodes to a valid JSON header with alg and enc
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		headerBytes, err = base64.URLEncoding.DecodeString(parts[0])
+		if err != nil {
+			return false
+		}
+	}
+	var header struct {
+		Alg string `json:"alg"`
+		Enc string `json:"enc"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return false
+	}
+	return header.Alg != "" && header.Enc != ""
 }
 
 // DecryptJWE decrypts a compact serialized JWE string using the provided RSA private key.

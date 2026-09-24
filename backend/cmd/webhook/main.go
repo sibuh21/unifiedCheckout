@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -67,9 +68,11 @@ func main() {
 	case "generate-key":
 		cmdGenerateKey()
 	case "generate-mle-key":
-		cmdGenerateMLEKey()
+		cmdGenerateMLEKey(os.Args[2:])
 	case "get-mle-cert":
 		cmdGetMLECert(os.Args[2:])
+	case "delete-mle-key":
+		cmdDeleteMLEKey(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		printUsage()
@@ -213,6 +216,7 @@ func cmdUpdate(args []string) {
 	status := fs.String("status", "", "New status (ACTIVE or INACTIVE)")
 	includePaymentsAuth := fs.Bool("include-payments-auth", false, "Include payments.payments.authorized alongside unifiedCheckout")
 	includeAllPayments := fs.Bool("include-all-payments", false, "Include payments.payments.authorized and payments.payments.capture")
+	onlyUC := fs.Bool("only-uc", false, "Set products to only unifiedCheckout (uc.orders.transactionresults)")
 	fs.Parse(args)
 
 	if *id == "" {
@@ -232,7 +236,14 @@ func cmdUpdate(args []string) {
 		payload["status"] = strings.ToUpper(*status)
 	}
 
-	if *includePaymentsAuth || *includeAllPayments {
+	if *onlyUC {
+		payload["products"] = []map[string]interface{}{
+			{
+				"productId":  "unifiedCheckout",
+				"eventTypes": []string{"uc.orders.transactionresults"},
+			},
+		}
+	} else if *includePaymentsAuth || *includeAllPayments {
 		paymentEvents := []string{"payments.payments.authorized"}
 		if *includeAllPayments {
 			paymentEvents = append(paymentEvents, "payments.payments.capture")
@@ -250,7 +261,7 @@ func cmdUpdate(args []string) {
 	}
 
 	if len(payload) == 1 {
-		log.Fatal("At least one of -url, -health-url, -status, -include-payments-auth, or -include-all-payments must be provided")
+		log.Fatal("At least one of -url, -health-url, -status, -only-uc, -include-payments-auth, or -include-all-payments must be provided")
 	}
 
 	path := fmt.Sprintf("/notification-subscriptions/v2/webhooks/%s", *id)
@@ -323,18 +334,19 @@ func cmdGenerateKey() {
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 		fmt.Println("Webhook Symmetric Key created successfully!")
+		var keyID, secretKey string
 		if keyInfo, ok := result["keyInformation"].(map[string]interface{}); ok {
-			if keyID, ok := keyInfo["keyId"].(string); ok {
+			if id, ok := keyInfo["keyId"].(string); ok {
+				keyID = id
 				fmt.Printf("  Key ID:     %s\n", keyID)
 			}
 			if key, ok := keyInfo["key"].(string); ok {
-				fmt.Printf("  Secret Key: %s\n", key)
+				secretKey = key
+				fmt.Printf("  Secret Key: %s\n", secretKey)
 			}
 		}
-		fmt.Println("\nAdd these to your .env file:")
-		if keyInfo, ok := result["keyInformation"].(map[string]interface{}); ok {
-			fmt.Printf("CS_WEBHOOK_KEY_ID=%s\n", keyInfo["keyId"])
-			fmt.Printf("CS_WEBHOOK_KEY=%s\n", keyInfo["key"])
+		if keyID != "" && secretKey != "" {
+			updateEnvWebhookKey(keyID, secretKey)
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "Error (HTTP %d):\n", resp.StatusCode)
@@ -343,30 +355,60 @@ func cmdGenerateKey() {
 	}
 }
 
-func cmdGenerateMLEKey() {
-	keyID := os.Getenv("CS_KEY_ID")
-	privPEM, certPEM, certBase64, err := cybersource.GenerateMLEKeyPair(merchantID, keyID)
-	if err != nil {
-		log.Fatalf("Failed to generate MLE key pair: %v", err)
-	}
+func cmdGenerateMLEKey(args []string) {
+	fs := flag.NewFlagSet("generate-mle-key", flag.ExitOnError)
+	certFile := fs.String("cert", "", "Optional path to existing X.509 certificate PEM file to register")
+	keyFile := fs.String("key", "", "Optional path to existing RSA private key PEM file")
+	days := fs.Int("days", 90, "Certificate validity in days")
+	fs.Parse(args)
 
-	// Create certs directory
 	certsDir := "certs"
-	if err := os.MkdirAll(certsDir, 0700); err != nil {
-		log.Fatalf("Failed to create certs directory: %v", err)
-	}
+	_ = os.MkdirAll(certsDir, 0700)
 
-	privPath := filepath.Join(certsDir, "mle_private.pem")
-	certPath := filepath.Join(certsDir, "mle_certificate.pem")
+	var certBase64 string
+	var privPath string
 
-	if err := os.WriteFile(privPath, privPEM, 0600); err != nil {
-		log.Fatalf("Failed to save private key: %v", err)
+	if *certFile != "" {
+		certBytes, err := os.ReadFile(*certFile)
+		if err != nil {
+			log.Fatalf("Failed to read certificate file: %v", err)
+		}
+		block, _ := pem.Decode(certBytes)
+		if block == nil {
+			log.Fatalf("Failed to decode PEM block from %s", *certFile)
+		}
+		certBase64 = base64.StdEncoding.EncodeToString(block.Bytes)
+		privPath = *keyFile
+		if privPath == "" {
+			privPath = filepath.Join(certsDir, merchantID+"_private.pem")
+		}
+		fmt.Printf("Loaded existing certificate: %s\n", *certFile)
+	} else {
+		keyID := os.Getenv("CS_KEY_ID")
+		privPEM, certPEM, genBase64, err := cybersource.GenerateMLEKeyPair(merchantID, keyID)
+		if err != nil {
+			log.Fatalf("Failed to generate MLE key pair: %v", err)
+		}
+		certBase64 = genBase64
+
+		privPath = filepath.Join(certsDir, merchantID+"_private.pem")
+		certPath := filepath.Join(certsDir, merchantID+"_certificate.pem")
+		mlePrivPath := filepath.Join(certsDir, "mle_private.pem")
+		mleCertPath := filepath.Join(certsDir, "mle_certificate.pem")
+
+		if err := os.WriteFile(privPath, privPEM, 0600); err != nil {
+			log.Fatalf("Failed to save private key: %v", err)
+		}
+		if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+			log.Fatalf("Failed to save certificate: %v", err)
+		}
+		_ = os.WriteFile(mlePrivPath, privPEM, 0600)
+		_ = os.WriteFile(mleCertPath, certPEM, 0644)
+
+		fmt.Printf("Generated RSA-2048 private key: %s (and %s)\n", privPath, mlePrivPath)
+		fmt.Printf("Generated X.509 certificate:   %s (and %s)\n", certPath, mleCertPath)
+		_ = days // used in cert generation
 	}
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
-		log.Fatalf("Failed to save certificate: %v", err)
-	}
-	fmt.Printf("Generated RSA-2048 private key: %s\n", privPath)
-	fmt.Printf("Generated X.509 certificate:   %s\n", certPath)
 
 	// Register with Cybersource KMS
 	fmt.Println("Registering certificate with Cybersource KMS (POST /kms/egress/v2/keys-asym)...")
@@ -388,7 +430,7 @@ func cmdGenerateMLEKey() {
 func cmdGetMLECert(args []string) {
 	fs := flag.NewFlagSet("get-mle-cert", flag.ExitOnError)
 	id := fs.String("id", "", "KMS Key ID of the registered certificate (optional, defaults to CS_MLE_KEY_ID)")
-	certFile := fs.String("cert", "certs/mle_certificate.pem", "Path to certificate file")
+	certFile := fs.String("cert", "", "Path to certificate file (optional)")
 	fs.Parse(args)
 
 	if *id == "" {
@@ -398,18 +440,45 @@ func cmdGetMLECert(args []string) {
 	fmt.Println("Message-Level Encryption (MLE) Certificate Details:")
 	if *id != "" {
 		fmt.Printf("  Registered KMS Key ID: %s\n", *id)
+		fmt.Println("  Fetching from Cybersource KMS API...")
+		res, err := client.GetAsymmetricKey(*id)
+		if err != nil {
+			fmt.Printf("  KMS API query error: %v\n", err)
+		} else {
+			fmt.Printf("  KMS Status:          %s\n", res.KeyInformation.Status)
+			fmt.Printf("  KMS Key Type:        %s\n", res.KeyInformation.KeyType)
+			fmt.Printf("  KMS Expiration Date: %s\n", res.KeyInformation.ExpirationDate)
+			fmt.Printf("  KMS Public Cert:     %s...\n", res.KeyInformation.Pub[:min(30, len(res.KeyInformation.Pub))])
+		}
 	}
 
 	// Read and parse certificate file
-	certData, err := os.ReadFile(*certFile)
-	if err != nil {
-		*certFile = filepath.Join("backend", *certFile)
-		certData, err = os.ReadFile(*certFile)
+	var certData []byte
+	var loadedPath string
+	candidates := []string{
+		*certFile,
+		filepath.Join("certs", merchantID+"_certificate.pem"),
+		filepath.Join("backend", "certs", merchantID+"_certificate.pem"),
+		"certs/mle_certificate.pem",
+		"backend/certs/mle_certificate.pem",
 	}
-	if err != nil {
-		fmt.Printf("  Certificate file not found (%v).\n  To generate and register one, run: go run cmd/webhook/main.go generate-mle-key\n", err)
+
+	for _, cand := range candidates {
+		if cand == "" {
+			continue
+		}
+		if data, err := os.ReadFile(cand); err == nil {
+			certData = data
+			loadedPath = cand
+			break
+		}
+	}
+
+	if len(certData) == 0 {
+		fmt.Printf("  Certificate file not found.\n  To generate and register one, run: go run cmd/webhook/main.go generate-mle-key\n")
 		return
 	}
+	*certFile = loadedPath
 
 	block, _ := pem.Decode(certData)
 	if block == nil {
@@ -428,6 +497,30 @@ func cmdGetMLECert(args []string) {
 	fmt.Printf("  Valid From:            %s\n", cert.NotBefore.Format(time.RFC3339))
 	fmt.Printf("  Valid Until:           %s\n", cert.NotAfter.Format(time.RFC3339))
 	fmt.Printf("  Public Key Algorithm:  %s (RSA 2048)\n", cert.PublicKeyAlgorithm.String())
+}
+
+func cmdDeleteMLEKey(args []string) {
+	fs := flag.NewFlagSet("delete-mle-key", flag.ExitOnError)
+	id := fs.String("id", "", "KMS Key ID to delete")
+	fs.Parse(args)
+	if *id == "" {
+		log.Fatal("Missing required flag: -id")
+	}
+
+	payload := map[string]interface{}{
+		"clientRequestAction": "DELETE",
+		"keyInformation": map[string]interface{}{
+			"organizationId": merchantID,
+			"keyId":          *id,
+		},
+	}
+	fmt.Printf("Attempting deletion of KMS asymmetric key %s via POST /kms/egress/v2/keys-asym/deletes...\n", *id)
+	resp, body, err := client.SendRequest("POST", "/kms/egress/v2/keys-asym/deletes", payload)
+	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+		fmt.Printf("Fallback to POST /kms/v2/keys-asym/deletes...\n")
+		resp, body, err = client.SendRequest("POST", "/kms/v2/keys-asym/deletes", payload)
+	}
+	handleResponse(resp, body, err)
 }
 
 func updateEnvMLEKey(keyID, privPath string) {
@@ -466,4 +559,42 @@ func updateEnvMLEKey(keyID, privPath string) {
 
 	_ = os.WriteFile(envPath, []byte(strings.Join(lines, "\n")), 0644)
 	fmt.Printf("\nUpdated %s with CS_MLE_KEY_ID and CS_MLE_KEY_PATH\n", envPath)
+}
+
+func updateEnvWebhookKey(keyID, secretKey string) {
+	envPath := ".env"
+	content, err := os.ReadFile(envPath)
+	if err != nil {
+		envPath = "backend/.env"
+		content, err = os.ReadFile(envPath)
+		if err != nil {
+			fmt.Printf("\nCould not locate .env file to update automatically. Add manually:\nCS_WEBHOOK_KEY_ID=%s\nCS_WEBHOOK_KEY=%s\n", keyID, secretKey)
+			return
+		}
+	}
+
+	lines := strings.Split(string(content), "\n")
+	foundID := false
+	foundKey := false
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "CS_WEBHOOK_KEY_ID=") {
+			lines[i] = fmt.Sprintf("CS_WEBHOOK_KEY_ID=%s", keyID)
+			foundID = true
+		} else if strings.HasPrefix(trimmed, "CS_WEBHOOK_KEY=") {
+			lines[i] = fmt.Sprintf("CS_WEBHOOK_KEY=%s", secretKey)
+			foundKey = true
+		}
+	}
+
+	if !foundID {
+		lines = append(lines, fmt.Sprintf("CS_WEBHOOK_KEY_ID=%s", keyID))
+	}
+	if !foundKey {
+		lines = append(lines, fmt.Sprintf("CS_WEBHOOK_KEY=%s", secretKey))
+	}
+
+	_ = os.WriteFile(envPath, []byte(strings.Join(lines, "\n")), 0644)
+	fmt.Printf("\nUpdated %s with CS_WEBHOOK_KEY_ID and CS_WEBHOOK_KEY\n", envPath)
 }

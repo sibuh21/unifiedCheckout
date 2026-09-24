@@ -260,6 +260,96 @@ func TestWebhookEndpointWithEncryptedJWE(t *testing.T) {
 	}
 }
 
+func TestWebhookEndpointWithEncDataWrapper(t *testing.T) {
+	MerchantID = "test_merchant"
+	WebhookKey = "test_webhook_key_super_secret"
+
+	// 1. Generate test MLE keys
+	privPEM, _, _, err := cybersource.GenerateMLEKeyPair("test_merchant", "test_key")
+	if err != nil {
+		t.Fatalf("GenerateMLEKeyPair failed: %v", err)
+	}
+	privKey, err := cybersource.LoadPrivateKey(string(privPEM))
+	if err != nil {
+		t.Fatalf("LoadPrivateKey failed: %v", err)
+	}
+	mlePrivKey = privKey
+
+	// 2. Encrypt test payload as JWE
+	innerJSON := []byte(`{"id":"evt_enc_456","eventType":"uc.orders.transactionresults","status":"SETTLED","orderCode":"ORD-ENC-999"}`)
+	jweString, err := cybersource.EncryptJWE(innerJSON, &privKey.PublicKey)
+	if err != nil {
+		t.Fatalf("EncryptJWE failed: %v", err)
+	}
+
+	// 3. Wrap in encData JSON like Cybersource sends
+	wrappedJSON, _ := json.Marshal(map[string]string{"encData": jweString})
+
+	r := gin.New()
+	r.POST("/api/webhooks/cybersource", func(c *gin.Context) {
+		rawBody, _ := c.GetRawData()
+		sigHeader := c.GetHeader("v-c-signature")
+		isValid, reason := verifyWebhookSignature(sigHeader, rawBody, WebhookKey)
+		if !isValid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": reason})
+			return
+		}
+
+		var payload map[string]interface{}
+		_ = json.Unmarshal(rawBody, &payload)
+
+		var jweStr string
+		if encData, ok := payload["encData"].(string); ok && cybersource.IsJWE(encData) {
+			jweStr = encData
+		}
+
+		if jweStr != "" && mlePrivKey != nil {
+			decrypted, err := cybersource.DecryptJWE(jweStr, mlePrivKey)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to decrypt JWE encData"})
+				return
+			}
+			var decryptedMap map[string]interface{}
+			_ = json.Unmarshal(decrypted, &decryptedMap)
+			payload = decryptedMap
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "received",
+			"id":        payload["id"],
+			"orderCode": payload["orderCode"],
+		})
+	})
+
+	now := time.Now().Unix()
+	body := wrappedJSON
+
+	dataToSign := fmt.Sprintf("%d.%s", now, string(body))
+	mac := hmac.New(sha256.New, []byte(WebhookKey))
+	mac.Write([]byte(dataToSign))
+	sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	req, _ := http.NewRequest("POST", "/api/webhooks/cybersource", bytes.NewBuffer(body))
+	req.Header.Set("v-c-signature", fmt.Sprintf("t=%s;keyId=test_key;sig=%s", strconv.FormatInt(now, 10), sig))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected HTTP 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var res map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if res["orderCode"] != "ORD-ENC-999" {
+		t.Errorf("Expected orderCode ORD-ENC-999, got %v", res["orderCode"])
+	}
+	if res["id"] != "evt_enc_456" {
+		t.Errorf("Expected id evt_enc_456, got %v", res["id"])
+	}
+}
+
 func TestTargetOriginsSelection(t *testing.T) {
 	// Test that origins are selected with HTTPS and reject IP addresses
 	if !isValidFQDNOrigin("https://localhost:5173") {

@@ -2,6 +2,7 @@ package cybersource
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -104,16 +106,57 @@ func (c *Client) SendRequest(method, path string, payload interface{}) (*http.Re
 		req.Header.Set("Digest", digest)
 	}
 
-	httpClient := &http.Client{Timeout: 45 * time.Second}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("cybersource request failed: %w", err)
+	dialer := &net.Dialer{
+		Timeout:   15 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Resolver: &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 4 * time.Second}
+				conn, err := d.DialContext(ctx, "udp", "8.8.8.8:53")
+				if err != nil {
+					conn, err = d.DialContext(ctx, "udp", "1.1.1.1:53")
+				}
+				if err != nil {
+					return d.DialContext(ctx, network, address)
+				}
+				return conn, nil
+			},
+		},
 	}
-	defer resp.Body.Close()
+	transport := &http.Transport{
+		DialContext:         dialer.DialContext,
+		TLSHandshakeTimeout: 15 * time.Second,
+	}
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   45 * time.Second,
+	}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return resp, nil, fmt.Errorf("failed to read response: %w", err)
+	var resp *http.Response
+	var respBody []byte
+	var lastErr error
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		resp, lastErr = httpClient.Do(req)
+		if lastErr == nil {
+			defer resp.Body.Close()
+			respBody, lastErr = io.ReadAll(resp.Body)
+			if lastErr == nil {
+				break
+			}
+		}
+		if attempt < 3 {
+			time.Sleep(1 * time.Second)
+			// Recreate reader for body if needed
+			if len(bodyBytes) > 0 {
+				req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			}
+		}
+	}
+
+	if lastErr != nil {
+		return resp, nil, fmt.Errorf("cybersource request failed: %w", lastErr)
 	}
 
 	log.Printf("[Cybersource API] %s https://%s%s -> HTTP %d (Payload length: %d bytes)", method, c.Host, path, resp.StatusCode, len(bodyBytes))
@@ -146,12 +189,12 @@ func (c *Client) RegisterAsymmetricKey(certBase64SingleLine string) (*KMSAsymmet
 	payload := map[string]interface{}{
 		"clientRequestAction": "STORE",
 		"keyInformation": map[string]interface{}{
-			"provider":       "nrtd",
-			"tenant":         c.MerchantID,
+			"provider":       c.MerchantID,
+			"tenant":         "nrtd",
 			"keyType":        "publickey",
 			"organizationId": c.MerchantID,
 			"pub":            certBase64SingleLine,
-			"expiryDuration": "365",
+			"expiryDuration": "90",
 		},
 	}
 

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -188,11 +190,15 @@ var (
 	mleKeyID     string
 	mleKeyPath   string
 	mlePrivKey   *rsa.PrivateKey
+	mlePrivKeys  []*rsa.PrivateKey
 )
 
 func loadMLEPrivateKey() {
 	mleKeyID = os.Getenv("CS_MLE_KEY_ID")
 	mleKeyPath = os.Getenv("CS_MLE_KEY_PATH")
+	mlePrivKeys = nil
+	mlePrivKey = nil
+
 	if mleKeyPath == "" {
 		for _, p := range []string{"certs/mle_private.pem", "backend/certs/mle_private.pem"} {
 			if _, err := os.Stat(p); err == nil {
@@ -204,11 +210,50 @@ func loadMLEPrivateKey() {
 	if mleKeyPath != "" {
 		if key, err := cybersource.LoadPrivateKey(mleKeyPath); err == nil {
 			mlePrivKey = key
+			mlePrivKeys = append(mlePrivKeys, key)
 			log.Printf("[MLE] Loaded Message-Level Encryption private key from %s (KeyID: %s)", mleKeyPath, mleKeyID)
 		} else {
 			log.Printf("[MLE] Warning: Failed to load MLE private key from %s: %v", mleKeyPath, err)
 		}
 	}
+
+	// Also load any other .pem private keys in certs/ directory as fallbacks
+	for _, dir := range []string{"certs", "backend/certs"} {
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if !f.IsDir() && strings.HasSuffix(f.Name(), ".pem") && strings.Contains(f.Name(), "private") {
+				p := filepath.Join(dir, f.Name())
+				if p == mleKeyPath {
+					continue
+				}
+				if key, err := cybersource.LoadPrivateKey(p); err == nil {
+					mlePrivKeys = append(mlePrivKeys, key)
+					if mlePrivKey == nil {
+						mlePrivKey = key
+					}
+					log.Printf("[MLE] Loaded fallback MLE private key from %s", p)
+				}
+			}
+		}
+	}
+}
+
+func decryptWithAnyKey(jweStr string) ([]byte, error) {
+	if len(mlePrivKeys) == 0 {
+		return nil, errors.New("no MLE private keys loaded on server")
+	}
+	var lastErr error
+	for _, key := range mlePrivKeys {
+		decrypted, err := cybersource.DecryptJWE(jweStr, key)
+		if err == nil {
+			return decrypted, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 func init() {
@@ -717,7 +762,6 @@ func main() {
 			})
 			return
 		}
-
 		// The capture context is returned as a signed JWT along with the generated order ID
 		respData := gin.H{
 			"jwt":           string(respBody),
@@ -782,6 +826,11 @@ func main() {
 			return
 		}
 
+		log.Printf("==================================================")
+		log.Printf("==================================================")
+		log.Printf("🔔 [CYBERSOURCE WEBHOOK RECEIVED] (%d bytes)", len(rawBody))
+		log.Printf("[Webhook Raw Payload]: %s", string(rawBody))
+
 		// Cybersource provides signature in `v-c-signature`
 		sigHeader := c.GetHeader("v-c-signature")
 		if sigHeader == "" {
@@ -799,13 +848,8 @@ func main() {
 		// Check if the entire raw body is a compact JWE string (Message-Level Encryption)
 		bodyToParse := rawBody
 		rawBodyStr := strings.TrimSpace(string(rawBody))
-		if cybersource.IsJWE(rawBodyStr) {
-			if mlePrivKey == nil {
-				log.Printf("[Webhook MLE] Received encrypted JWE payload, but server private key is not loaded (check CS_MLE_KEY_PATH)")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "MLE private key not configured on server"})
-				return
-			}
-			decrypted, err := cybersource.DecryptJWE(rawBodyStr, mlePrivKey)
+		if !strings.HasPrefix(rawBodyStr, "{") && !strings.HasPrefix(rawBodyStr, "[") && cybersource.IsJWE(rawBodyStr) {
+			decrypted, err := decryptWithAnyKey(rawBodyStr)
 			if err != nil {
 				log.Printf("[Webhook MLE] Failed to decrypt JWE: %v", err)
 				c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to decrypt JWE payload", "details": err.Error()})
@@ -822,22 +866,55 @@ func main() {
 			return
 		}
 
-		// Check if inner 'payload' field is an encrypted JWE string
-		if innerJWE, ok := payload["payload"].(string); ok && cybersource.IsJWE(innerJWE) {
-			if mlePrivKey != nil {
-				decryptedInner, err := cybersource.DecryptJWE(innerJWE, mlePrivKey)
-				if err == nil {
-					var innerMap map[string]interface{}
-					if err := json.Unmarshal(decryptedInner, &innerMap); err == nil {
-						payload["payload"] = innerMap
-						log.Printf("[Webhook MLE] Successfully decrypted inner JWE payload field (%d bytes)", len(decryptedInner))
+		// Check if inner 'encData' or 'payload' field is an encrypted JWE string
+		var jweString string
+		var jweField string
+		if encData, ok := payload["encData"].(string); ok && cybersource.IsJWE(encData) {
+			jweString = encData
+			jweField = "encData"
+		} else if innerPayload, ok := payload["payload"].(string); ok && cybersource.IsJWE(innerPayload) {
+			jweString = innerPayload
+			jweField = "payload"
+		}
+
+		if jweString != "" {
+			// Extract JWE header to see which kid Cybersource used
+			parts := strings.Split(jweString, ".")
+			var jweKid string
+			if len(parts) > 0 {
+				if hdrBytes, err := base64.RawURLEncoding.DecodeString(parts[0]); err == nil {
+					var hdr struct {
+						Kid string `json:"kid"`
 					}
+					_ = json.Unmarshal(hdrBytes, &hdr)
+					jweKid = hdr.Kid
+				}
+			}
+			fmt.Println("kid:===>", jweKid)
+
+			decryptedInner, err := decryptWithAnyKey(jweString)
+			if err == nil {
+				var decryptedMap map[string]interface{}
+				if err := json.Unmarshal(decryptedInner, &decryptedMap); err == nil {
+					payload = decryptedMap
+					log.Printf("[Webhook MLE] Successfully decrypted JWE %s (KeyID: %s, %d bytes)", jweField, jweKid, len(decryptedInner))
 				} else {
-					log.Printf("[Webhook MLE] Failed to decrypt inner JWE payload: %v", err)
+					payload[jweField] = string(decryptedInner)
+					log.Printf("[Webhook MLE] Successfully decrypted JWE %s (%d bytes)", jweField, len(decryptedInner))
 				}
 			} else {
-				log.Printf("[Webhook MLE] Inner payload is JWE, but server private key is not configured")
+				log.Printf("[Webhook MLE] Failed to decrypt inner JWE (%s): %v (JWE kid='%s', configured CS_MLE_KEY_ID='%s')", jweField, err, jweKid, mleKeyID)
+				if jweKid != "" && mleKeyID != "" && jweKid != mleKeyID {
+					log.Printf("[Webhook MLE KEY MISMATCH] Cybersource encrypted this webhook using key '%s', but your server private key has CS_MLE_KEY_ID='%s'. Please provide the private key for key ID '%s'!", jweKid, mleKeyID, jweKid)
+				}
 			}
+		}
+
+		if prettyJSON, err := json.MarshalIndent(payload, "", "  "); err == nil {
+			log.Printf("[Webhook Decrypted Payload]:\n%s", string(prettyJSON))
+		} else {
+			compactJSON, _ := json.Marshal(payload)
+			log.Printf("[Webhook Decrypted Payload]: %s", string(compactJSON))
 		}
 
 		// Extract notification fields
@@ -884,6 +961,51 @@ func main() {
 			}
 		}
 
+		// Support transactionResult singular object (standard in Unified Checkout)
+		if innerPayload, ok := payload["payload"].(map[string]interface{}); ok {
+			if txResult, ok := innerPayload["transactionResult"].(map[string]interface{}); ok {
+				if resourceID == "" {
+					resourceID, _ = txResult["id"].(string)
+				}
+				if status == "" {
+					status, _ = txResult["status"].(string)
+				}
+				if details, ok := txResult["details"].(map[string]interface{}); ok {
+					if orderCode == "" {
+						if clientRef, ok := details["clientReferenceInformation"].(map[string]interface{}); ok {
+							orderCode, _ = clientRef["code"].(string)
+						}
+					}
+					if resourceID == "" {
+						resourceID, _ = details["id"].(string)
+					}
+					if status == "" {
+						status, _ = details["status"].(string)
+					}
+				}
+			}
+		} else if txResult, ok := payload["transactionResult"].(map[string]interface{}); ok {
+			if resourceID == "" {
+				resourceID, _ = txResult["id"].(string)
+			}
+			if status == "" {
+				status, _ = txResult["status"].(string)
+			}
+			if details, ok := txResult["details"].(map[string]interface{}); ok {
+				if orderCode == "" {
+					if clientRef, ok := details["clientReferenceInformation"].(map[string]interface{}); ok {
+						orderCode, _ = clientRef["code"].(string)
+					}
+				}
+				if resourceID == "" {
+					resourceID, _ = details["id"].(string)
+				}
+				if status == "" {
+					status, _ = details["status"].(string)
+				}
+			}
+		}
+
 		// Support transactionResults array (standard in uc.orders.transactionresults)
 		if txResults, ok := payload["transactionResults"].([]interface{}); ok && len(txResults) > 0 {
 			if firstTx, ok := txResults[0].(map[string]interface{}); ok {
@@ -921,13 +1043,12 @@ func main() {
 		}
 
 		log.Printf("==================================================")
-		log.Printf("🔔 [CYBERSOURCE WEBHOOK NOTIFICATION RECEIVED]")
+		log.Printf("🔔 [CYBERSOURCE WEBHOOK PROCESSED]")
 		log.Printf("Type:        %s", eventType)
 		log.Printf("Status:      %s", status)
 		log.Printf("Order Code:  %s", orderCode)
 		log.Printf("Resource ID: %s", resourceID)
 		log.Printf("Signature:   Verified=%v (%s)", isValid, reason)
-		log.Printf("Payload:     %s", string(rawBody))
 		log.Printf("==================================================")
 
 		orderStore.RecordWebhook(event)

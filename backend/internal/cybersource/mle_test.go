@@ -56,6 +56,12 @@ func TestMLEKeyGenerationAndDecryption(t *testing.T) {
 		t.Error("IsJWE returned true for regular JSON")
 	}
 
+	// Test minified JSON with exactly 4 dots (which previously caused false positive)
+	minifiedJSONWithDots := `{"eventType":"uc.orders.transactionresults","time":"12:00:00.000","amount":"200.00"}`
+	if IsJWE(minifiedJSONWithDots) {
+		t.Error("IsJWE returned true for minified JSON containing 4 dots")
+	}
+
 	decrypted, err := DecryptJWE(compactJWE, privKey)
 	if err != nil {
 		t.Fatalf("DecryptJWE failed: %v", err)
